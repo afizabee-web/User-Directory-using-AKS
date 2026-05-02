@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgress
+  namespace: stateful
+spec:
+  clusterIP: None
+  selector:
+    db: postgress-db
+  ports:
+    port: 5432
+
