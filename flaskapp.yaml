@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flask-app
+  namespace: app
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: flask-app
+  template:
+    metadata:
+      labels:
+        app: flask-app
+        azure.workload.identity/use: "true"
+    spec:
+      volumes:
+      - name: secrets-store-inline
+        csi:
+          driver: secrets-store.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: "postgres-secrets-kv"
+      containers:
+      - name: flask-app-container
+        image: acr1234.azurecr.io/flask-app:v4
+        ports:
+        - containerPort: 5000
+        resources:
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+          requests:
+            cpu: "250m"
+            memory: "128Mi"
+        env:
+          # Database host
+          - name: DB_HOST
+            value: "postgres-read.database.svc.cluster.local"
+
+          # Keys from Key Vault via CSI — original names
+          - name: POSTGRES_DB
+            valueFrom:
+              secretKeyRef:
+                name: postgress-secret
+                key: db
+          - name: POSTGRES_USER
+            valueFrom:
+              secretKeyRef:
+                name: postgress-secret
+                key: user
+          - name: POSTGRES_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: postgress-secret
+                key: password
+
+          # Aliases — what app.py actually reads
+          - name: DB_NAME
+            valueFrom:
+              secretKeyRef:
+                name: postgress-secret
+                key: db
+          - name: DB_USER
+            valueFrom:
+              secretKeyRef:
+                name: postgress-secret
+                key: user
+          - name: DB_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: postgress-secret
+                key: password
+
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 5000
+          initialDelaySeconds: 20
+          periodSeconds: 15
+        volumeMounts:
+        - name: secrets-store-inline
+          mountPath: "/mnt/secrets-store"
+          readOnly: true
