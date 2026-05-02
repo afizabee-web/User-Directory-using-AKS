@@ -1,0 +1,130 @@
+Follow these steps in exact order to deploy the full project on a new AKS cluster.
+Step 1 — Enable AKS Add-ons (OIDC, Workload Identity, CSI Driver)
+# Enable OIDC issuer and Workload Identity on the cluster
+az aks update \
+  --resource-group AKS-RG \
+  --name cluster-test \
+  --enable-oidc-issuer \
+  --enable-workload-identity
+
+# Enable the Azure Key Vault CSI driver addon
+az aks enable-addons \
+  --resource-group AKS-RG \
+  --name cluster-test \
+  --addons azure-keyvault-secrets-provider
+
+# Enable AGIC (Application Gateway Ingress Controller)
+az aks enable-addons \
+  --resource-group AKS-RG \
+  --name cluster-test \
+  --addons ingress-appgw \
+  --appgw-name myAppGateway \
+  --appgw-subnet-cidr '10.225.0.0/16'
+
+# Verify all addons are enabled:
+az aks show -g AKS-RG -n cluster-test --query addonProfiles
+Step 2 — Create Managed Identity & Federated Credentials
+# Get OIDC issuer URL
+AKS_OIDC=$(az aks show -g AKS-RG -n cluster-test \
+  --query 'oidcIssuerProfile.issuerUrl' -o tsv)
+
+# Create federated credential for 'database' namespace
+az identity federated-credential create \
+  --name postgres-fed-cred \
+  --identity-name cluster-test-agentpool \
+  --resource-group MC_AKS-RG_cluster-test_centralindia \
+  --issuer $AKS_OIDC \
+  --subject system:serviceaccount:database:default \
+  --audience api://AzureADTokenExchange
+
+# Create federated credential for 'app' namespace
+az identity federated-credential create \
+  --name flask-app-fed-cred \
+  --identity-name cluster-test-agentpool \
+  --resource-group MC_AKS-RG_cluster-test_centralindia \
+  --issuer $AKS_OIDC \
+  --subject system:serviceaccount:app:default \
+  --audience api://AzureADTokenExchange
+
+# Verify federated credentials were created:
+az identity federated-credential list \
+  --identity-name cluster-test-agentpool \
+  --resource-group MC_AKS-RG_cluster-test_centralindia -o table
+Step 3 — Key Vault Access & Secrets
+IDENTITY_OID=$(az identity show \
+  --name cluster-test-agentpool \
+  --resource-group MC_AKS-RG_cluster-test_centralindia \
+  --query principalId -o tsv)
+
+az keyvault set-policy \
+  --name akskeyvault \
+  --secret-permissions get list \
+  --object-id $IDENTITY_OID
+
+az keyvault secret set --vault-name akskeyvault --name postgres-password --value 'YourPassword'
+az keyvault secret set --vault-name akskeyvault --name postgres-user --value 'postgres'
+az keyvault secret set --vault-name akskeyvault --name postgres-db --value 'mydb'
+Step 4 — Annotate Service Accounts
+CLIENT_ID=acadf60e-b9ea-4254-b86e-a0d23f057c21
+
+kubectl annotate serviceaccount default -n database \
+  azure.workload.identity/client-id=$CLIENT_ID --overwrite
+
+kubectl annotate serviceaccount default -n app \
+  azure.workload.identity/client-id=$CLIENT_ID --overwrite
+
+# Verify annotations:
+kubectl get sa default -n database -o yaml | grep azure.workload
+kubectl get sa default -n app -o yaml | grep azure.workload
+Step 5 — Deploy SecretProviderClass in Both Namespaces
+kubectl apply -f secretproviderclass.yaml
+
+# Copy to app namespace if SPC only exists in database:
+kubectl get secretproviderclass postgres-secrets-kv -n database -o yaml \
+  | sed 's/namespace: database/namespace: app/' \
+  | kubectl apply -f -
+
+kubectl get secretproviderclass -A   # Verify in both namespaces
+Step 6 — Deploy PostgreSQL StatefulSet
+kubectl apply -f postgress.yaml
+kubectl get po -n database -w
+# Wait for postgress-0 Running 1/1
+# Then postgress-1 and postgress-2 will start
+
+# Check PVCs were created:
+kubectl get pvc -n database
+# Expected: 3 PVCs all Bound
+
+# Check PostgreSQL logs:
+kubectl logs postgress-0 -n database
+# Should see: database system is ready to accept connections
+Step 7 — Deploy Flask Application
+kubectl apply -f flaskapp.yaml
+kubectl get po -n app -w
+# Wait for 3/3 pods Running 1/1
+
+# Verify secrets are mounted:
+kubectl exec -it <flask-pod> -n app -- ls /mnt/secrets-store
+# Expected: postgres-db  postgres-password  postgres-user
+
+# Check Flask app logs:
+kubectl logs <flask-pod> -n app
+Step 8 — Configure DNS & Ingress
+# Get the Application Gateway's public IP (if using AGIC):
+kubectl get ingress -n app
+
+# OR get the App Gateway IP directly from Azure:
+az network public-ip show \
+  --resource-group AKS-RG \
+  --name myAppGateway-pip \
+  --query ipAddress -o tsv
+
+# Add DNS A record pointing afizabee.online to the external IP:
+az network dns record-set a add-record \
+  --resource-group AKS-RG \
+  --zone-name afizabee.online \
+  --record-set-name '@' \
+  --ipv4-address <EXTERNAL-IP>
+
+# Verify site is accessible:
+curl -I http://afizabee.online
